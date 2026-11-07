@@ -1,10 +1,19 @@
 name: instabox-watchdog
 
-# Kenapa tiap 5 menit:
-#   - Free tier: idle 30 menit -> pause. 5 menit memberi jendela pemulihan sempit.
-#   - Free tier: maxRun 120-180 menit -> stop. Kita reset 10 menit sebelum batas.
-# Batas ini DITOLAK kalau diubah lewat API (403 spec_not_allowed / permission_denied),
-# jadi satu-satunya cara adalah pengawas eksternal seperti ini.
+# Dua batas free tier InstaBox, dua strategi:
+#
+# 1. Idle pause 30 menit -> DICEGAH, bukan diobati.
+#    Kunjungan ke port publik = aktivitas (docs/ports.md: "A visit wakes a
+#    machine that paused itself for being idle"). Ping tiap 5 menit membuat
+#    timer idle tidak pernah mencapai 30 menit.
+#
+# 2. Max run 120-180 menit -> DI-RESET lewat suspend+resume.
+#    Diuji langsung: runStartedAt jadi null saat suspend, terisi ulang saat
+#    resume, processesPreserved: true -> proses tidak hilang.
+#
+# Keduanya tidak bisa diubah lewat API:
+#   403 spec_not_allowed  "Free users are not able to change idle time"
+#   403 permission_denied "free machines have a managed maxRunMinutes"
 
 on:
   schedule:
@@ -23,6 +32,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Ping port publik (cegah idle pause)
+        continue-on-error: true
+        env:
+          HEALTH_URLS: ${{ secrets.HEALTH_URLS }}
+        run: |
+          set -u
+          for U in $(echo "${HEALTH_URLS:-}" | tr ',' ' '); do
+            [ -z "$U" ] && continue
+            CODE=$(curl -s -o /dev/null -m 45 -w '%{http_code}' "$U" || echo 000)
+            echo "ping $U -> HTTP $CODE"
+          done
+
       - name: Jaga mesin tetap hidup
         env:
           IBX_KEY: ${{ secrets.INSTABOX_API_KEY }}
