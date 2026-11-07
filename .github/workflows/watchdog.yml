@@ -1,0 +1,94 @@
+name: instabox-watchdog
+
+# Kenapa tiap 5 menit:
+#   - Free tier: idle 30 menit -> pause. 5 menit memberi jendela pemulihan sempit.
+#   - Free tier: maxRun 120-180 menit -> stop. Kita reset 10 menit sebelum batas.
+# Batas ini DITOLAK kalau diubah lewat API (403 spec_not_allowed / permission_denied),
+# jadi satu-satunya cara adalah pengawas eksternal seperti ini.
+
+on:
+  schedule:
+    - cron: "* * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: instabox-watchdog
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Jaga mesin tetap hidup
+        env:
+          IBX_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          IBX_MACHINES: ${{ secrets.MACHINE_IDS }}
+        run: |
+          set -u
+          API="https://api.instabox.sh"
+          BUFFER=10   # reset 10 menit sebelum max-run habis
+
+          ibx() { # method path [body]
+            local m="$1" p="$2" b="${3:-}"
+            local args=(-s -X "$m" "$API$p" -H "X-API-Key: $IBX_KEY" -H "Content-Type: application/json")
+            if [ "$m" != "GET" ]; then args+=(-H "Idempotency-Key: $(uuidgen)"); fi
+            if [ -n "$b" ]; then args+=(-d "$b"); fi
+            curl "${args[@]}"
+          }
+
+          # MACHINE_IDS dipisah koma
+          IFS=',' read -ra IDS <<< "$IBX_MACHINES"
+
+          for RAW in "${IDS[@]}"; do
+            ID="$(echo "$RAW" | xargs)"
+            [ -z "$ID" ] && continue
+
+            J="$(ibx GET "/v1/machines/$ID")"
+            STATE="$(echo "$J" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d.get("machine",d);print(m.get("state",""))' 2>/dev/null)"
+            MAXRUN="$(echo "$J" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d.get("machine",d);print(m.get("maxRunMinutes") or 120)' 2>/dev/null)"
+            STARTED="$(echo "$J" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d.get("machine",d);print(m.get("runStartedAt") or "")' 2>/dev/null)"
+
+            echo "::group::$ID state=$STATE maxRun=$MAXRUN started=$STARTED"
+
+            case "$STATE" in
+              suspended)
+                echo "paused -> resume"
+                ibx POST "/v1/machines/$ID/resume" "" >/dev/null
+                ;;
+              stopped)
+                echo "stopped -> start (COLD BOOT: proses hilang, systemd harus enabled)"
+                ibx POST "/v1/machines/$ID/start" "" >/dev/null
+                ;;
+              running)
+                if [ -z "$STARTED" ]; then
+                  echo "running tapi runStartedAt kosong, lewati"
+                else
+                  AGE="$(python3 -c "
+          from datetime import datetime, timezone
+          s='$STARTED'.replace('Z','+00:00')
+          try: t=datetime.fromisoformat(s)
+          except Exception: print(-1); raise SystemExit
+          print(int((datetime.now(timezone.utc)-t).total_seconds()//60))
+          ")"
+                  THRESH=$((MAXRUN - BUFFER))
+                  echo "umur ${AGE}m dari batas ${MAXRUN}m (reset di ${THRESH}m)"
+                  if [ "$AGE" -ge "$THRESH" ] && [ "$AGE" -ge 0 ]; then
+                    echo "reset jam max-run: suspend lalu resume"
+                    ibx POST "/v1/machines/$ID/suspend" "" >/dev/null
+                    sleep 8
+                    ibx POST "/v1/machines/$ID/resume" "" >/dev/null
+                  fi
+                fi
+                ;;
+              *)
+                echo "state=$STATE, tidak ada aksi"
+                ;;
+            esac
+            echo "::endgroup::"
+          done
+
+          echo "selesai pada $(date -u +%FT%TZ)"
